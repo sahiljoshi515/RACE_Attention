@@ -1,256 +1,215 @@
+// ============================================================================
+// Causal RACE backward — exact forward-scan + chunked parallel scan.
+//
+// Computes gradients of the causal RACE forward (forward_kernel.cu) w.r.t.
+// probsK, probsQ and V2. The causal prefix states A(t), B(t) are rebuilt by a
+// FORWARD scan (never by reverse subtraction from finals, and never stored in
+// fp16) so the gradients are numerically exact at all sequence lengths. Every
+// scan is chunked over the time axis (chunk C, G=ceil(T/C)) for SM occupancy.
+//
+// Let G(t)[s] = sum_d grad_out[t,d]*B(t)[s,d], inv=1/(A(t)[s]+eps).
+//   gradProbsQ[t,s] = G(t)[s]*inv
+//   gradA(t)[s]     = -probsQ[t,s]*G(t)[s]*inv^2
+//   gB(t)[s,d]      = probsQ[t,s]*grad_out[t,d]*inv
+//   gAn(t)[s]       = sum_{tau>=t} gradA(tau)[s]   (suffix sum)
+//   gBn(t)[s,d]     = sum_{tau>=t} gB(tau)[s,d]    (suffix sum)
+//   gradProbsK[t,s] = gAn(t)[s] + sum_d gBn(t)[s,d]*V2[t,d]
+//   gradV[t,d]      = sum_s probsK[t,s]*gBn(t)[s,d]
+//
+// pass1 (forward): chunk B/A offsets -> readout gradProbsQ, gradA, A_all.
+// pass2 (reverse): per-chunk reverse totals of gB, gradA -> suffix offsets (shared
+//                  by the gradProbsK and gradV readouts).
+// ============================================================================
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
-#include <cuda_fp16.h>
 #include <stdint.h>
+#include <vector>
+
 using at::Tensor;
 
-// -------------------- warp+block reductions (float) --------------------
-__inline__ __device__ float warp_reduce_sum(float val)
+__inline__ __device__ float warp_reduce_sum(float v)
 {
-    unsigned mask = 0xffffffffu;
-    for (int offset = 16; offset > 0; offset >>= 1)
-    {
-        val += __shfl_down_sync(mask, val, offset);
-    }
-    return val;
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    return v;
 }
-__inline__ __device__ float block_reduce_sum(float val)
+__inline__ __device__ float block_reduce_sum(float v)
 {
-    __shared__ float shared[32];
-    int lane = threadIdx.x & 31;
-    int wid = threadIdx.x >> 5;
-    val = warp_reduce_sum(val);
-    if (lane == 0)
-        shared[wid] = val;
+    __shared__ float sh[32];
+    int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    v = warp_reduce_sum(v);
+    if (lane == 0) sh[wid] = v;
     __syncthreads();
-    int nwarps = (blockDim.x + 31) >> 5;
-    val = (threadIdx.x < nwarps) ? shared[lane] : 0.0f;
-    if (wid == 0)
-        val = warp_reduce_sum(val);
-    return val;
+    int nw = (blockDim.x + 31) >> 5;
+    v = (threadIdx.x < nw) ? sh[lane] : 0.0f;
+    if (wid == 0) v = warp_reduce_sum(v);
+    return v;
+}
+static inline int pad_to_warp(int D) { int b = ((D + 31) / 32) * 32; return b < 32 ? 32 : (b > 1024 ? 1024 : b); }
+
+// ---- pass1 chunk partial sums (fwd): cB[n,s,g,d]=sum pk*v, cA[n,s,g]=sum pk ----
+__global__ void racebwd_p1_totals(const float *__restrict__ pK, const float *__restrict__ V2,
+                                  float *__restrict__ cB, float *__restrict__ cA,
+                                  int N, int T, int S, int D, int C, int G)
+{
+    int g = blockIdx.x, s = blockIdx.y, n = blockIdx.z, d = threadIdx.x;
+    int t0 = g * C, t1 = min(t0 + C, T); if (t0 >= T) return;
+    float lb = 0.f, la = 0.f; bool hd = d < D;
+    for (int t = t0; t < t1; ++t) { float pk = pK[((size_t)n*T+t)*S+s]; la += pk; if (hd) lb += pk*V2[((size_t)n*T+t)*(size_t)D+d]; }
+    if (hd) cB[(((size_t)n*S+s)*G+g)*(size_t)D+d] = lb;
+    if (d == 0) cA[((size_t)n*S+s)*G+g] = la;
 }
 
-// ============================================================================
-// Computes gradK and gradQ without a linear timee forward scan:
-//   init A,B from A_final/B_final, then do a reverse scan across the token dimension (T)
-// Outputs:
-//   gradK [N,T,S], gradQ [N,T,S]
-// ============================================================================
-__global__ void race_bwd_kq_noscan_cuda(
-    const float *__restrict__ probsK,   // [N,T,S]
-    const float *__restrict__ probsQ,   // [N,T,S]
-    const float *__restrict__ V2,       // [N,T,D]
-    const float *__restrict__ grad_out, // [N,T,D]
-    const float *__restrict__ A_final,  // [N,S]
-    const __half *__restrict__ B_final, // [N,S,D] fp16
-    float *__restrict__ gradK,          // [N,T,S]
-    float *__restrict__ gradQ,          // [N,T,S]
-    int N, int T, int S, int D,
-    float eps)
+// ---- forward exclusive scan over g (in place): off[g] = sum_{g'<g} c[g'] ----
+__global__ void racebwd_scan_fwd(float *__restrict__ cB, float *__restrict__ cA, int N, int S, int D, int G)
 {
-    int n = blockIdx.y;
-    int s = blockIdx.x;
-    int tid = threadIdx.x;
-    if (n >= N || s >= S)
-        return;
+    int s = blockIdx.x, n = blockIdx.y, tid = threadIdx.x;
+    if (tid == 0) { float r = 0.f; for (int g = 0; g < G; ++g) { size_t i = ((size_t)n*S+s)*G+g; float v = cA[i]; cA[i] = r; r += v; } }
+    for (int d = tid; d < D; d += blockDim.x) { float r = 0.f; for (int g = 0; g < G; ++g) { size_t i = (((size_t)n*S+s)*G+g)*(size_t)D+d; float v = cB[i]; cB[i] = r; r += v; } }
+}
 
-    extern __shared__ float sh[];
-    float *sh_B = sh;         // [D]
-    float *sh_gBn = sh_B + D; // [D]
-    __shared__ float sh_A;
-    __shared__ float sh_gAn;
-
-    // init from finals
-    for (int d = tid; d < D; d += blockDim.x)
-    {
-        size_t idxBf = ((size_t)n * (size_t)S + (size_t)s) * (size_t)D + (size_t)d;
-        sh_B[d] = __half2float(B_final[idxBf]);
-        sh_gBn[d] = 0.0f;
-    }
-    if (tid == 0)
-    {
-        sh_A = A_final[(size_t)n * (size_t)S + (size_t)s];
-        sh_gAn = 0.0f;
-    }
+// ---- pass1 readout (fwd): gradProbsQ, gradA, A_all ----
+__global__ void racebwd_p1_readout(const float *__restrict__ pK, const float *__restrict__ pQ,
+                                   const float *__restrict__ V2, const float *__restrict__ GO,
+                                   const float *__restrict__ offA, const float *__restrict__ offB,
+                                   float *__restrict__ gradProbsQ, float *__restrict__ gradA, float *__restrict__ A_all,
+                                   int N, int T, int S, int D, int C, int G, float eps)
+{
+    int g = blockIdx.x, s = blockIdx.y, n = blockIdx.z, tid = threadIdx.x;
+    int t0 = g * C, t1 = min(t0 + C, T); if (t0 >= T) return;
+    extern __shared__ float shB[];               // [D]
+    __shared__ float shA;
+    for (int d = tid; d < D; d += blockDim.x) shB[d] = offB[(((size_t)n*S+s)*G+g)*(size_t)D+d];
+    if (tid == 0) shA = offA[((size_t)n*S+s)*G+g];
     __syncthreads();
-
-    for (int t = T - 1; t >= 0; --t)
+    for (int t = t0; t < t1; ++t)
     {
-        size_t idxKS = ((size_t)n * (size_t)T + (size_t)t) * (size_t)S + (size_t)s;
-        float pk = probsK[idxKS];
-        float pq = probsQ[idxKS];
-
-        float A = sh_A;
-        float denom = A + eps;
-        float inv = 1.0f / denom;
-        float inv2 = inv * inv;
-
-        float gradA_loc_part = 0.0f;
-        float gradQ_part = 0.0f;
-        float sum_gBv_part = 0.0f;
-
-        size_t baseVD = ((size_t)n * (size_t)T + (size_t)t) * (size_t)D;
-
-        for (int d = tid; d < D; d += blockDim.x)
-        {
-            float B = sh_B[d];
-            float v = V2[baseVD + (size_t)d];
-            float go = grad_out[baseVD + (size_t)d];
-
-            float E = B * inv;
-            gradQ_part += go * E;
-
-            float U = pq * go;
-            float gB_loc = U * inv;
-            gradA_loc_part += U * (-B) * inv2;
-
-            float gB = gB_loc + sh_gBn[d];
-            sh_gBn[d] = gB;
-
-            sum_gBv_part += gB * v;
-        }
-
-        float gradA_loc = block_reduce_sum(gradA_loc_part);
-        float gradQ_val = block_reduce_sum(gradQ_part);
-        float sum_gBv = block_reduce_sum(sum_gBv_part);
-
-        if (tid == 0)
-        {
-            float gA = gradA_loc + sh_gAn;
-            gradK[idxKS] = gA + sum_gBv;
-            gradQ[idxKS] = gradQ_val;
-            sh_gAn = gA;
-        }
+        size_t iKS = ((size_t)n*T+t)*S+s; float pk = pK[iKS], pq = pQ[iKS];
+        if (tid == 0) shA += pk;
         __syncthreads();
-
-        // update to t-1
-        if (tid == 0)
-            sh_A -= pk;
-        for (int d = tid; d < D; d += blockDim.x)
-        {
-            float v = V2[baseVD + (size_t)d];
-            sh_B[d] -= pk * v;
-        }
+        float A = shA; size_t bVD = ((size_t)n*T+t)*(size_t)D;
+        float Gp = 0.f;
+        for (int d = tid; d < D; d += blockDim.x) { float b = shB[d] + pk*V2[bVD+d]; shB[d] = b; Gp += GO[bVD+d]*b; }
+        float Gr = block_reduce_sum(Gp);
+        if (tid == 0) { float inv = 1.f/(A+eps); gradProbsQ[iKS] = Gr*inv; gradA[iKS] = -pq*Gr*inv*inv; A_all[iKS] = A; }
         __syncthreads();
     }
 }
 
-// ============================================================================
-// Contains the necessary logic to invoke race_bwd_kq_noscan_cuda
-//     and computes the gradient of K and the gradient of Q
-// Outputs:
-//   gradK [N,T,S], gradQ [N,T,S]
-// ============================================================================
-std::vector<Tensor> race_bwd_kq_noscan(
-    Tensor probsK, Tensor probsQ, Tensor V2, Tensor grad_out,
-    Tensor A_final, Tensor B_final, float eps)
+// ---- pass2 chunk reverse totals: cGB[n,s,g,d]=sum gB, cGA[n,s,g]=sum gradA ----
+__global__ void racebwd_p2_totals(const float *__restrict__ pQ, const float *__restrict__ GO,
+                                  const float *__restrict__ A_all, const float *__restrict__ gradA,
+                                  float *__restrict__ cGB, float *__restrict__ cGA,
+                                  int N, int T, int S, int D, int C, int G, float eps)
+{
+    int g = blockIdx.x, s = blockIdx.y, n = blockIdx.z, d = threadIdx.x;
+    int t0 = g * C, t1 = min(t0 + C, T); if (t0 >= T) return;
+    float lgb = 0.f, lga = 0.f; bool hd = d < D;
+    for (int t = t0; t < t1; ++t)
+    {
+        size_t iKS = ((size_t)n*T+t)*S+s; float pq = pQ[iKS]; float inv = 1.f/(A_all[iKS]+eps);
+        lga += gradA[iKS];
+        if (hd) lgb += pq*GO[((size_t)n*T+t)*(size_t)D+d]*inv;
+    }
+    if (hd) cGB[(((size_t)n*S+s)*G+g)*(size_t)D+d] = lgb;
+    if (d == 0) cGA[((size_t)n*S+s)*G+g] = lga;
+}
+
+// ---- reverse exclusive scan over g (in place): off[g] = sum_{g'>g} c[g'] ----
+__global__ void racebwd_scan_rev(float *__restrict__ cGB, float *__restrict__ cGA, int N, int S, int D, int G)
+{
+    int s = blockIdx.x, n = blockIdx.y, tid = threadIdx.x;
+    if (tid == 0) { float r = 0.f; for (int g = G-1; g >= 0; --g) { size_t i = ((size_t)n*S+s)*G+g; float v = cGA[i]; cGA[i] = r; r += v; } }
+    for (int d = tid; d < D; d += blockDim.x) { float r = 0.f; for (int g = G-1; g >= 0; --g) { size_t i = (((size_t)n*S+s)*G+g)*(size_t)D+d; float v = cGB[i]; cGB[i] = r; r += v; } }
+}
+
+// ---- pass2 gradProbsK readout (reverse): gradProbsK = gAn + sum_d gBn[d]*v ----
+__global__ void racebwd_p2_kq(const float *__restrict__ pQ, const float *__restrict__ V2, const float *__restrict__ GO,
+                              const float *__restrict__ A_all, const float *__restrict__ gradA,
+                              const float *__restrict__ sgAoff, const float *__restrict__ sgBoff,
+                              float *__restrict__ gradProbsK,
+                              int N, int T, int S, int D, int C, int G, float eps)
+{
+    int g = blockIdx.x, s = blockIdx.y, n = blockIdx.z, tid = threadIdx.x;
+    int t0 = g * C, t1 = min(t0 + C, T); if (t0 >= T) return;
+    extern __shared__ float shGB[];              // [D]
+    __shared__ float shGA;
+    for (int d = tid; d < D; d += blockDim.x) shGB[d] = sgBoff[(((size_t)n*S+s)*G+g)*(size_t)D+d];
+    if (tid == 0) shGA = sgAoff[((size_t)n*S+s)*G+g];
+    __syncthreads();
+    for (int t = t1 - 1; t >= t0; --t)
+    {
+        size_t iKS = ((size_t)n*T+t)*S+s; float pq = pQ[iKS]; float inv = 1.f/(A_all[iKS]+eps);
+        if (tid == 0) shGA += gradA[iKS];
+        size_t bVD = ((size_t)n*T+t)*(size_t)D; float sv = 0.f;
+        for (int d = tid; d < D; d += blockDim.x) { float gB = pq*GO[bVD+d]*inv; float gg = shGB[d]+gB; shGB[d] = gg; sv += gg*V2[bVD+d]; }
+        float sgbv = block_reduce_sum(sv);
+        if (tid == 0) gradProbsK[iKS] = shGA + sgbv;
+        __syncthreads();
+    }
+}
+
+// ---- pass2 gradV readout (reverse): gradV[t,d] = sum_s pk*gBn[s]  (block=S threads) ----
+__global__ void racebwd_p2_v(const float *__restrict__ pK, const float *__restrict__ pQ, const float *__restrict__ GO,
+                             const float *__restrict__ A_all, const float *__restrict__ sgBoff,
+                             float *__restrict__ gradV,
+                             int N, int T, int S, int D, int C, int G, float eps)
+{
+    int g = blockIdx.x, n = blockIdx.y, d = blockIdx.z, s = threadIdx.x;
+    int t0 = g * C, t1 = min(t0 + C, T); if (t0 >= T || s >= S) return;
+    extern __shared__ float red[];               // [S]
+    float gBn = sgBoff[(((size_t)n*S+s)*G+g)*(size_t)D+d];
+    for (int t = t1 - 1; t >= t0; --t)
+    {
+        size_t iKS = ((size_t)n*T+t)*S+s; float inv = 1.f/(A_all[iKS]+eps);
+        gBn += pQ[iKS]*GO[((size_t)n*T+t)*(size_t)D+d]*inv;
+        red[s] = pK[iKS]*gBn;
+        __syncthreads();
+        if (s == 0) { float tot = 0.f; for (int i = 0; i < S; ++i) tot += red[i]; gradV[((size_t)n*T+t)*(size_t)D+d] = tot; }
+        __syncthreads();
+    }
+}
+
+// ---- host wrapper: returns {gradProbsK, gradProbsQ, gradV} ----
+std::vector<Tensor> race_backward(Tensor probsK, Tensor probsQ, Tensor V2, Tensor grad_out, float eps, int64_t chunk)
 {
     TORCH_CHECK(probsK.is_cuda() && probsQ.is_cuda() && V2.is_cuda() && grad_out.is_cuda(), "CUDA only");
-    TORCH_CHECK(A_final.is_cuda() && B_final.is_cuda(), "CUDA only");
-    TORCH_CHECK(probsK.scalar_type() == at::kFloat && probsQ.scalar_type() == at::kFloat && V2.scalar_type() == at::kFloat, "fp32 only");
-    TORCH_CHECK(grad_out.scalar_type() == at::kFloat, "grad_out fp32");
-    TORCH_CHECK(A_final.scalar_type() == at::kFloat, "A_final fp32");
-    TORCH_CHECK(B_final.scalar_type() == at::kHalf, "B_final fp16");
-
+    TORCH_CHECK(probsK.scalar_type() == at::kFloat && probsQ.scalar_type() == at::kFloat && V2.scalar_type() == at::kFloat && grad_out.scalar_type() == at::kFloat, "fp32 only");
     int N = probsK.size(0), T = probsK.size(1), S = probsK.size(2), D = V2.size(2);
+    TORCH_CHECK(S <= 1024, "S must be <= 1024");
+    int C = (int)chunk; if (C <= 0) C = 8192; if (C > T) C = T; int G = (T + C - 1) / C;
+    auto opt = torch::TensorOptions().device(probsK.device()).dtype(at::kFloat);
 
-    auto gK = torch::empty_like(probsK);
-    auto gQ = torch::empty_like(probsQ);
+    auto cB = torch::empty({N, S, G, D}, opt), cA = torch::empty({N, S, G}, opt);
+    auto A_all = torch::empty({N, T, S}, opt), gradA = torch::empty({N, T, S}, opt);
+    auto gradProbsQ = torch::empty({N, T, S}, opt), gradProbsK = torch::empty({N, T, S}, opt);
+    auto gradV = torch::empty_like(grad_out);
+    auto cGB = torch::empty({N, S, G, D}, opt), cGA = torch::empty({N, S, G}, opt);
 
-    dim3 grid(S, N, 1);
-    int threads = 256;
-    size_t shmem = (size_t)(2 * D) * sizeof(float);
+    int blk = pad_to_warp(D);
+    dim3 gGSN((unsigned)G, (unsigned)S, (unsigned)N), gSN((unsigned)S, (unsigned)N, 1);
+    size_t shD = (size_t)D * sizeof(float);
+    const float *pK = probsK.data_ptr<float>(), *pQ = probsQ.data_ptr<float>(),
+                *v = V2.data_ptr<float>(), *go = grad_out.data_ptr<float>();
 
-    race_bwd_kq_noscan_cuda<<<grid, threads, shmem>>>(
-        probsK.data_ptr<float>(),
-        probsQ.data_ptr<float>(),
-        V2.data_ptr<float>(),
-        grad_out.data_ptr<float>(),
-        A_final.data_ptr<float>(),
-        (const __half *)B_final.data_ptr<at::Half>(),
-        gK.data_ptr<float>(),
-        gQ.data_ptr<float>(),
-        N, T, S, D, eps);
-    return {gK, gQ};
-}
+    // pass1
+    racebwd_p1_totals<<<gGSN, blk>>>(pK, v, cB.data_ptr<float>(), cA.data_ptr<float>(), N, T, S, D, C, G);
+    racebwd_scan_fwd<<<gSN, 256>>>(cB.data_ptr<float>(), cA.data_ptr<float>(), N, S, D, G);
+    racebwd_p1_readout<<<gGSN, blk, shD>>>(pK, pQ, v, go, cA.data_ptr<float>(), cB.data_ptr<float>(),
+        gradProbsQ.data_ptr<float>(), gradA.data_ptr<float>(), A_all.data_ptr<float>(), N, T, S, D, C, G, eps);
 
-// ============================================================================
-// Backward for gradV (NO forward scan):
-// Uses only A_final[n,s], reverse scan over t, reduces over s in-block.
-// One block per (n,d), threads over s (S <= 1024).
-// ============================================================================
-__global__ void race_bwd_v_noscan_cuda(
-    const float *__restrict__ probsK,   // [N,T,S]
-    const float *__restrict__ probsQ,   // [N,T,S]
-    const float *__restrict__ grad_out, // [N,T,D]
-    const float *__restrict__ A_final,  // [N,S]
-    float *__restrict__ gradV,          // [N,T,D]
-    int N, int T, int S, int D,
-    float eps)
-{
-    int n = blockIdx.y;
-    int d = blockIdx.x;
-    int s = threadIdx.x;
-    if (n >= N || d >= D || s >= S)
-        return;
+    // pass2 shared totals + reverse scan
+    racebwd_p2_totals<<<gGSN, blk>>>(pQ, go, A_all.data_ptr<float>(), gradA.data_ptr<float>(),
+        cGB.data_ptr<float>(), cGA.data_ptr<float>(), N, T, S, D, C, G, eps);
+    racebwd_scan_rev<<<gSN, 256>>>(cGB.data_ptr<float>(), cGA.data_ptr<float>(), N, S, D, G);
 
-    float A = A_final[(size_t)n * (size_t)S + (size_t)s];
-    float gBn = 0.0f;
+    // pass2 readouts (share cGB/cGA suffix offsets)
+    racebwd_p2_kq<<<gGSN, blk, shD>>>(pQ, v, go, A_all.data_ptr<float>(), gradA.data_ptr<float>(),
+        cGA.data_ptr<float>(), cGB.data_ptr<float>(), gradProbsK.data_ptr<float>(), N, T, S, D, C, G, eps);
+    dim3 gGND((unsigned)G, (unsigned)N, (unsigned)D); dim3 bS((unsigned)S, 1, 1);
+    size_t shS = (size_t)S * sizeof(float);
+    racebwd_p2_v<<<gGND, bS, shS>>>(pK, pQ, go, A_all.data_ptr<float>(), cGB.data_ptr<float>(),
+        gradV.data_ptr<float>(), N, T, S, D, C, G, eps);
 
-    for (int t = T - 1; t >= 0; --t)
-    {
-        size_t idxKS = ((size_t)n * (size_t)T + (size_t)t) * (size_t)S + (size_t)s;
-        float pk = probsK[idxKS];
-        float pq = probsQ[idxKS];
-
-        size_t idxVD = ((size_t)n * (size_t)T + (size_t)t) * (size_t)D + (size_t)d;
-        float go = grad_out[idxVD];
-
-        float inv = 1.0f / (A + eps);
-        float gB_loc = (pq * go) * inv;
-        float gB = gB_loc + gBn;
-
-        float contrib = gB * pk;
-        float total = block_reduce_sum(contrib);
-        if (s == 0)
-            gradV[idxVD] = total;
-
-        __syncthreads();
-        gBn = gB;
-        A -= pk;
-        __syncthreads();
-    }
-}
-
-// ============================================================================
-// Contains the necessary logic to invoke race_bwd_v_noscan_cuda
-//     and computes the gradient of V
-// Outputs:
-//   gradV [N,T,D]
-// ============================================================================
-Tensor race_bwd_v_noscan(
-    Tensor probsK, Tensor probsQ, Tensor grad_out, Tensor A_final, float eps)
-{
-    TORCH_CHECK(probsK.is_cuda() && probsQ.is_cuda() && grad_out.is_cuda() && A_final.is_cuda(), "CUDA only");
-    TORCH_CHECK(probsK.scalar_type() == at::kFloat && probsQ.scalar_type() == at::kFloat, "fp32 only");
-    TORCH_CHECK(grad_out.scalar_type() == at::kFloat, "grad_out fp32");
-    TORCH_CHECK(A_final.scalar_type() == at::kFloat, "A_final fp32");
-
-    int N = probsK.size(0), T = probsK.size(1), S = probsK.size(2), D = grad_out.size(2);
-    TORCH_CHECK(S <= 1024, "S must be <= 1024 for this kernel");
-
-    auto gV = torch::empty_like(grad_out);
-
-    dim3 grid(D, N, 1);
-    dim3 block(S, 1, 1);
-
-    race_bwd_v_noscan_cuda<<<grid, block>>>(
-        probsK.data_ptr<float>(),
-        probsQ.data_ptr<float>(),
-        grad_out.data_ptr<float>(),
-        A_final.data_ptr<float>(),
-        gV.data_ptr<float>(),
-        N, T, S, D, eps);
-    return gV;
+    return {gradProbsK, gradProbsQ, gradV};
 }
