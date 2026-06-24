@@ -1,0 +1,2 @@
+# Transient fetch cache written by scripts/build_reviews.sh (re-derivable from the OpenReview API).
+.openreview-raw.json
