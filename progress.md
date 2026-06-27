@@ -30,29 +30,35 @@ layers replaced by linear-time RACE soft-LSH attention) that keeps accuracy whil
 life. Locked config: **AR/S24** = alternating, **14 of 28** attention layers → RACE with **L=3, K=3
 (S=24 buckets)**. Constraints: configs ∈ AR(50%)/ARRR(75%) × {S8,S24}; **no learnable hash**.
 
-### Best model so far → `distill/checkpoints/best/race_hybrid_AR_S24_p1f_unfreeze_step1340.pt`
-Stage F (MLP-unfrozen). **Headline result: unfreezing the MLPs recovered BOTH general knowledge AND
-long-context retrieval — the frozen base, not RACE's bucket readout, was the dominant limiter.**
+### Best model so far → `distill/checkpoints/best/race_hybrid_AR_S24_p1g_curriculum_step1050.pt`
+Stage G (MLP-unfreeze + **4K→16K→32K length curriculum**). **Two headlines: (1) unfreezing the MLPs
+recovered BOTH general knowledge AND long-context retrieval — the frozen base, not RACE's bucket
+readout, was the limiter; (2) training at the eval length via a curriculum then more than DOUBLED the
+longest context.**
 
-| metric | frozen base (Stage C) | **Stage F (best)** | teacher |
-|---|--:|--:|--:|
-| MMLU (5-shot) | 24.7 | **34.5** | 62 |
-| HellaSwag | 36.5 | **55.4** | 70.5 |
-| Winogrande | 52.1 | **55.1** | 69.9 |
-| RULER-16K | 22.9 | **54.6** | 80.5 |
-| RULER-32K | 15.2 | **42.7** | 80.2 |
-| ppl (teacher-forced) | ~21 | **6.2** | 15.2 |
+| metric | frozen base (Stage C) | Stage F (@4K only) | **Stage G (curriculum, best)** | teacher |
+|---|--:|--:|--:|--:|
+| MMLU (5-shot) | 24.7 | 34.5 | **35.7** | 62 |
+| HellaSwag | 36.5 | 55.4 | **56.1** | 70.5 |
+| Winogrande | 52.1 | 55.1 | 54.0 | 69.9 |
+| RULER-16K | 22.9 | 54.6 | **55.3** | 80.5 |
+| RULER-32K | 15.2 | 42.7 | **47.4** | 80.2 |
+| RULER-64K | — | 21.0 | **45.0** | 80.5 |
+| LongBench | — | — | **19.9** | 47.2 |
 
-`niah_single_1` 0→100@16K, `variable_tracking` 0→24, `niah_multivalue` 27→74; only `cwe` stays 0. All
-curves were still rising at 351M tokens. The Stage-F `.pt` carries `base_state` (trained MLPs, ~5.6 GB);
-`eval_ruler.build_model` / `eval_choice` load it automatically when present.
+The curriculum lifted **RULER-64K 21.0→45.0 (>2×)** and 32K 42.7→47.4 at no cost to general knowledge
+(MMLU even ticked up). `niah_single_1` 0→100@16K, `variable_tracking` 0→24; only `cwe` stays 0. The
+`.pt` carries `base_state` (trained MLPs, ~5.6 GB); `eval_ruler.build_model` / `eval_choice` load it
+automatically. **Remaining gap to teacher: RULER ~80 vs ~50, and LongBench 19.9 vs 47.2** (diverse
+summarization/code/few-shot generation tasks still lag — the next lever).
 
 ### The staged RADLADS-style recipe (each stage `--load-race-checkpoint`s the previous)
 `A align` (FineWeb, hidden-MSE, lr 1e-4 — **not** 1e-3, that diverges since we replace attention) →
 `B KD` (mixed FineWeb+synthetic-RULER, `0.1·hidden + 1·KL + 0.5·CE`, de-collapses: NIAH-4K 0→1.0, ppl
 22.5) → `C ctx-ext` (4K→16K, RULER-16K 22.9) → **`F unfreeze`** (continue from C with `--unfreeze mlp`,
-**base-LR 5e-5**, ~351M tok, plain mixed @4K — recovers both axes, table above). `G` (in flight) adds a
-4K→16K→32K length **curriculum** on top of unfreeze (~600M tok). Loss objective lives in
+**base-LR 5e-5**, ~351M tok, plain mixed @4K — recovers both axes) → **`G` (current best)** = unfreeze +
+a **4K→16K→32K length curriculum** (`--curriculum 4096:0,16384:200,32768:800`, max-steps 1050, ~600M
+tok), which doubled RULER-64K (table above). Loss objective lives in
 `global_utils.py` (hidden MSE + `T²`-scaled `KL(teacher‖student)` + next-token CE); it is **logit/KD
 distillation with dark knowledge**, T currently 1.
 
@@ -90,11 +96,12 @@ Distillation scripts (global + local) + the RACE CUDA kernel were **verified fai
 5-agent test workflow — zero critical/major bugs; custom backward matches fp64 to ~1e-6 (the earlier
 fp16 reverse-subtraction backward bug is fixed). Reusable suite: `distill/tests_*.py` + `run_tests_*.sbatch`.
 
-### In flight
-- **Stage G** (`p1g_curriculum`, unfreeze + 4K→16K→32K curriculum, ~600M tok) — running; on completion
-  run the full eval suite vs Stage F to see if the curriculum lifts long-context numbers.
-- Open: `cwe` (frequency aggregation) still 0; push more tokens + retrieval-head placement; 4-config
-  sweep only after AR/S24 clears.
+### Done / next
+- **Stage G complete & is the new best** (eval jobs 144876/144877/144878): curriculum lifted RULER-64K
+  21→45, 32K 42.7→47.4, held MMLU/HS. Promoted to `checkpoints/best/race_hybrid_AR_S24_p1g_curriculum_step1050.pt`.
+- Open levers: **LongBench 19.9 ≪ teacher 47.2** (diverse generation tasks lag — likely needs more
+  general-LM data / longer schedule, not just retrieval aug); close the RULER gap to teacher (~50 vs 80);
+  `cwe` (frequency aggregation) still 0; only then the 4-config (AR/ARRR × S8/S24) sweep.
 
 Full writeup: `RACE2_DISTILLATION_REPORT.md`. Per-stage detail: `distill/checkpoints/best/MANIFEST.md`
 (not in git — on disk) + the `distill/REPORT_*.md` files.
