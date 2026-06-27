@@ -1,0 +1,39 @@
+# ---- RACE_Attention .gitignore ----
+# Keep source only. Checkpoints (238 GB), datasets, experiment outputs,
+# and JIT-built CUDA extensions are NOT version-controlled.
+
+# Python / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# JIT-built CUDA extension caches (torch load() output)
+.torch_ext/
+.torch_ext_distill/
+.torch_ext_fa3/
+
+# Model checkpoints / weights (huge; live on the cluster filesystem only)
+distill/checkpoints/
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.ckpt
+
+# Staged datasets (re-stageable; multi-GB)
+data/
+
+# Experiment outputs (metrics, plots, run logs) — regenerable
+distill/results/
+scaling/results/
+*.jsonl
+*.out
+*.err
+slurm-*.out
+
+# Reference PDFs (papers; not needed to run)
+*.pdf
+
+# OS cruft
+.DS_Store
