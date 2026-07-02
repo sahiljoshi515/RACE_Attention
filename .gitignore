@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# JIT-built extensions / torch extension caches
+.torch_ext*/
+*.so
+
+# chat launcher runtime artifacts (created on first run, never committed)
+chat/.venv/
+chat/.uv-cache/
+chat/.torch_ext/
+chat/weights/
+
+# venvs / caches
+.venv/
+.uv-cache/
