@@ -53,12 +53,28 @@ the `nanochat` package name clash (`scaling/bench_race_vs_softmax_cpu.py`):
 | **softmax** (SDPA) | **3103 ms** | 1.00× |
 | **RACE** (CPU prefix-scan) | **3707 ms** | 1.20× slower |
 
-**At the trained context length, softmax is ~1.2× faster than RACE on CPU.**
-RACE's O(T) linear-attention scaling is outweighed at T=2048 by its constant
-factors — soft-hash projections, S=24 per-bucket prefix scans, and the `probsQ`
-gather — whereas softmax attention is O(T²) but runs as a single tight
-BLAS/SDPA call. The crossover (where RACE's linear scaling wins) is at longer
-context; see the T-sweep in this file / commit for the trend.
+**At the trained context length, softmax is faster than RACE on CPU** (~1.2–1.35×
+depending on warmup/reps). RACE's O(T) linear-attention scaling is outweighed at
+T=2048 by its constant factors — soft-hash projections, S=24 per-bucket prefix
+scans, and the `probsQ` gather — whereas softmax attention is O(T²) but runs as a
+single tight BLAS/SDPA call.
+
+### T-sweep (full forward, B=1, 16 threads, reps=2)
+
+| T | RACE | softmax | RACE / softmax |
+|---|---|---|---|
+| 512  | 1233 ms  | 801 ms   | 1.54× slower |
+| 1024 | 2343 ms  | 1551 ms  | 1.51× |
+| 2048 | 4579 ms  | 3402 ms  | 1.35× |
+| 4096 | 8608 ms  | 6940 ms  | 1.24× |
+| 8192 | 20007 ms | 18069 ms | 1.11× |
+
+Softmax is faster at **every** tested length, but the ratio **narrows
+monotonically** (1.54× → 1.11×) — the O(T)-vs-O(T²) signature: RACE closes the
+gap as T grows. The crossover (RACE overtakes) is **beyond T=8192**, i.e. well
+past the 2048 context this model was trained at. Takeaway: on CPU, PyTorch SDPA's
+tiny constant factor means RACE's linear scaling does not pay off in the trained
+regime; RACE would only win at much longer contexts.
 
 ### Reproduce
 ```bash
