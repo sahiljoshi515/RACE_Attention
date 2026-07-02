@@ -43,13 +43,13 @@ if command -v uv >/dev/null 2>&1; then
   [ -d "$VENV" ] || uv venv --python 3.10 "$VENV"
   # shellcheck disable=SC1091
   source "$VENV/bin/activate"
-  python -c "import torch, tiktoken, huggingface_hub" 2>/dev/null || \
+  python -c "import torch, tiktoken, huggingface_hub, setuptools" 2>/dev/null || \
     uv pip install -r "$HERE/requirements.txt" --extra-index-url "$PT_INDEX"
 else
   [ -d "$VENV" ] || python3 -m venv "$VENV"
   # shellcheck disable=SC1091
   source "$VENV/bin/activate"
-  python -c "import torch, tiktoken, huggingface_hub" 2>/dev/null || {
+  python -c "import torch, tiktoken, huggingface_hub, setuptools" 2>/dev/null || {
     pip install --quiet --upgrade pip
     pip install -r "$HERE/requirements.txt" --extra-index-url "$PT_INDEX"
   }

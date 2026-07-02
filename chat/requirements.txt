@@ -6,3 +6,5 @@ tiktoken
 filelock
 huggingface_hub>=0.24
 ninja
+setuptools
+wheel
